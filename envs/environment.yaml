@@ -1,0 +1,29 @@
+name: snakemake-ribo
+channels:
+    - conda-forge               
+    - defaults                  
+    - bioconda      
+    - cyclus
+dependencies:
+    - snakemake-minimal >=6.0.5
+    - networkx
+    - python>=3.7
+    - nextflow=19.04.1
+    - openjdk=8
+    - samtools
+    - sra-tools>=2.9.1
+    - fastqc
+    - setuptools 
+    - pip
+    - numpy
+    - pandas
+    - matplotlib
+    - biopython
+    - bowtie2=2.3.4.3
+    - hisat2=2.1.0
+    - pysam
+    - bedtools=2.27.1
+    - cutadapt=1.18
+    - pip:
+      - git+https://github.com/ribosomeprofiling/ribopy.git
+      - git+https://github.com/ribosomeprofiling/rfcommands.git 

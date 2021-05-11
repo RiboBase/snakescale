@@ -1,0 +1,959 @@
+import os
+import subprocess 
+import yaml 
+import pandas as pd
+import gzip
+from Bio import SeqIO
+import sys
+from snakemake.utils import validate
+
+sys.path.append("./scripts/")
+from generate_yaml import generate_yaml
+from guess_adapters import guess_adapter
+
+configfile:   "config/config.yaml"
+
+
+validate(config, "schemas/config.schema.yaml")
+
+ruleorder: download_fastq_files > gzip_fastq > check_adapter > check_adapter_stats > check_lengths > modify_yaml > classify_studies > run_riboflow
+
+STUDIES = config['studies']
+
+ERROR_STUDIES_LIST = []
+ERROR_MESSAGE_LIST = []
+
+# =========== GENERATING THE PROJECT.YAML FILES =============
+
+template_file = "project.yaml"
+if not os.path.isfile(template_file):
+    print("The template file for RiboFlow ({}) is missing.".format(template_file))
+    exit(1)
+
+for study in STUDIES:
+    study_yaml_path = "input/project/{gse_only}/{study}.yaml".format(gse_only = study.split("_")[0], study = study)
+    try:
+        if not os.path.isfile(study_yaml_path):
+            print("Currently working on {study}".format(study = study))
+            generate_yaml(db            = "db/db.sqlite3", 
+                          output        = "input/project/", 
+                          template      = template_file, 
+                          study         = study, 
+                          download_path = "input/fastq/")
+
+    except Exception as e:
+        ERROR_STUDIES_LIST.append(study)
+        ERROR_MESSAGE_LIST.append(str(e))
+
+with open("yaml_status.txt", "w") as f:
+    f.write("The following studies had issues in generating the project.yaml\n")
+
+    for idx,study in enumerate(ERROR_STUDIES_LIST):
+        f.write(study)
+        f.write(": " + ERROR_MESSAGE_LIST[idx] + "\n")
+
+        
+STUDIES = [study for study in STUDIES if study not in ERROR_STUDIES_LIST]
+
+
+    
+    
+# ===========================================================
+# ====================== HELPER FUNCTIONS ===================
+# ===========================================================
+
+# Extracts the Accession Numbers of Interest Based on the File Paths
+# Used to get the SRR accessions
+def generate_download_parameters(gsm_dict):
+    SRR_dict = {}
+    # SRR_list and download_dir_list 
+    for gsm in gsm_dict:
+        cur_dir_list = gsm_dict[gsm]
+        # numerous SRR's can be associated with a specific experiment (GSM#######)
+        for dir_path in cur_dir_list:
+            dir_path_list     = dir_path.split("/")
+            # splitting handles both cases: 
+            # srr_1.fastq -> srr_1 -> srr; srr.fastq -> srr -> srr 
+            cur_srr           = dir_path_list[-1].split(".")[0].split("_")[0]
+            output_dir_path   = "/".join(dir_path_list[0:-1])
+            SRR_dict[cur_srr] = output_dir_path
+    return SRR_dict
+
+# ===========================================================
+# ======================= INPUT FUNCTITONS ==================
+# ===========================================================
+
+def get_fastq_paths(wildcards):
+    with open("input/project/{gse}/{study}".format(gse = wildcards.study.split("_")[0], study = wildcards.study), "r") as f:
+        study = yaml.load(f, Loader=yaml.FullLoader)
+        return study
+
+
+def get_srr_dict(wildcards):
+    study = wildcards.study
+    # Read in the current version of the yaml file
+    ribo_yaml = {}
+    with open("input/project/{gse_only}/{study}.yaml".format(gse_only = study.split("_")[0], study = study)) as file:
+        ribo_yaml = yaml.load(file, Loader=yaml.FullLoader)
+
+    # Get the fastq file paths
+    riboseq_dict    = ribo_yaml['input']['fastq']
+    ribo_fastq_base = ribo_yaml['input']['fastq_base']
+
+    # Add the fastq_base parameter to each of the file paths
+    # Ribo-Seq Experiment File Paths
+    for gsm in riboseq_dict:
+        dir_list          = riboseq_dict[gsm]
+        modify_dir_list   = [os.path.join(ribo_fastq_base, dir) for dir in dir_list]
+        riboseq_dict[gsm] = modify_dir_list
+
+    rnaseq_dict    = {}
+    rna_fastq_base = ""
+    # A matching RNA-Seq may not exist for a given Ribo-Seq experiment
+    if 'rnaseq' in ribo_yaml:
+        rnaseq_dict    = ribo_yaml['rnaseq']['fastq']
+        rna_fastq_base = ribo_yaml['rnaseq']['fastq_base']
+
+        # RNA-Seq Experiments File Paths
+        for gsm in rnaseq_dict:
+            dir_list = rnaseq_dict[gsm]
+            modify_dir_list = [os.path.join(rna_fastq_base, dir) for dir in dir_list]
+            rnaseq_dict[gsm] = modify_dir_list
+
+    # Multiple SRRs in a list correspond to one experiment, flatten the nested lists
+    riboseq_nested_list = list(riboseq_dict.values())
+    riboseq_list        = [".".join(path.split(".")[0:-1]) for list_path in riboseq_nested_list for path in list_path]
+
+    rnaseq_nested_list = list(rnaseq_dict.values())
+    rnaseq_list        = [".".join(path.split(".")[0:-1]) for list_path in rnaseq_nested_list for path in list_path]
+
+    # Look for the presence of the .fastq files (file output from fasterq-dump)
+    fastq_paths = riboseq_list + rnaseq_list
+
+    # Useful to have the ribo and rna information separated
+    ribo_srr_dict = generate_download_parameters(riboseq_dict)
+    rna_srr_dict  = generate_download_parameters(rnaseq_dict)
+
+    ribo_exp_set = set(ribo_srr_dict.keys())
+    rna_exp_set  = set(rna_srr_dict.keys())
+    srr_dict     = {**ribo_srr_dict, **rna_srr_dict}
+    return srr_dict
+
+def get_rnaseq_srr_dict(wildcards):
+    study = wildcards.study
+    # Read in the current version of the yaml file
+    ribo_yaml = {}
+    with open("input/project/{gse_only}/{study}.yaml".format(gse_only = study.split("_")[0], study = study)) as file:
+        ribo_yaml = yaml.load(file, Loader=yaml.FullLoader)
+
+    rnaseq_dict = {}
+    rna_fastq_base = ""
+    # A matching RNA-Seq may not exist for a given Ribo-Seq experiment
+    if 'rnaseq' in ribo_yaml:
+        rnaseq_dict    = ribo_yaml['rnaseq']['fastq']
+        rna_fastq_base = ribo_yaml['rnaseq']['fastq_base']
+
+        # RNA-Seq Experiments File Paths
+        for gsm in rnaseq_dict:
+            dir_list         = rnaseq_dict[gsm]
+            modify_dir_list  = [os.path.join(rna_fastq_base, dir) for dir in dir_list]
+            rnaseq_dict[gsm] = modify_dir_list
+    
+    rnaseq_nested_list = list(rnaseq_dict.values())
+    rnaseq_list        = [".".join(path.split(".")[0:-1]) for list_path in rnaseq_nested_list for path in list_path]
+
+    # Useful to have the ribo and rna information separated
+    rna_srr_dict = generate_download_parameters(rnaseq_dict)
+    return rna_srr_dict
+
+def get_rnaseq_srr_path(wildcards):
+    rna_srr_dict = get_rnaseq_srr_dict(wildcards)
+    return ["{dir}/{accession}_1.fastq.gz".format(accession = k, dir = v) for k, v in rna_srr_dict.items()]
+
+def get_riboseq_srr_dict(wildcards):
+    study = wildcards.study
+    # Read in the current version of the yaml file
+    ribo_yaml = {}
+    with open("input/project/{gse_only}/{study}.yaml".format(gse_only = study.split("_")[0], study = study)) as file:
+        ribo_yaml = yaml.load(file, Loader=yaml.FullLoader)
+
+    # Get the fastq file paths
+    riboseq_dict = ribo_yaml['input']['fastq']
+    ribo_fastq_base = ribo_yaml['input']['fastq_base']
+
+    # Add the fastq_base parameter to each of the file paths
+    # Ribo-Seq Experiment File Paths
+    for gsm in riboseq_dict:
+        dir_list = riboseq_dict[gsm]
+        modify_dir_list = [os.path.join(ribo_fastq_base, dir) for dir in dir_list]
+        riboseq_dict[gsm] = modify_dir_list
+
+
+    # Multiple SRRs in a list correspond to one experiment, flatten the nested lists
+    riboseq_nested_list = list(riboseq_dict.values())
+    riboseq_list        = [".".join(path.split(".")[0:-1]) for list_path in riboseq_nested_list for path in list_path]
+
+    ribo_srr_dict = generate_download_parameters(riboseq_dict)
+    ribo_exp_set  = set(ribo_srr_dict.keys())
+    return ribo_srr_dict
+
+def get_riboseq_srr_path(wildcards):
+    ribo_srr_dict = get_riboseq_srr_dict(wildcards)
+    return ["{dir}/{accession}_1.fastq.gz".format(accession = k, dir = v) for k, v in ribo_srr_dict.items()]
+
+def get_ribo_yaml(wildcards):
+    return "input/project/{gse_only}/{study}.yaml".format(gse_only = wildcards.study.split("_")[0], study = wildcards.study)
+
+def get_cutadapt_summaries(wildcards):
+    srr_dict = get_srr_dict(wildcards)
+    return ["adapter_check_output/" + str(wildcards.study) + "/{accession}_cutadapt_stats.tsv".format(accession = k) for k, v in srr_dict.items()]
+
+def get_fastq_files(wildcards):
+    srr_dict = get_srr_dict(wildcards)
+    return ["{dir}/{accession}_1.fastq.gz".format(accession = k, dir = v) for k, v in srr_dict.items()]
+
+def get_fastq_path(wildcards):
+    srr_dict = get_srr_dict(wildcards)
+    return "{dir}/{accession}_1.fastq.gz".format(accession = wildcards.accession, dir = srr_dict[wildcards.accession])
+
+
+# =============================================================
+# ====================  SNAKEMAKE RULES  ======================
+# =============================================================
+
+rule all:
+    input: ["log/riboflow_status/{study}/riboflow_status.txt".format(study = study) for study in STUDIES]
+
+################################################################
+# creates a regex that matches to the studies specified in the config, potentially helps resolve wildcards
+wildcard_constraints:
+    study    = '|'.join([re.escape(x) for x in STUDIES]),
+    gse_only = '|'.join([re.escape(x.split("_")[0]) for x in STUDIES])
+
+################################################################
+# runs only after all of the yaml files are generated
+rule download_fastq_files:
+    output:
+        "{dir}/{accession}_1.fastq"
+    threads: config['threads']['download_fastq_files']
+    run:
+        cur_file = str(wildcards.dir) + "/" + str(wildcards.accession) + ".fastq"
+        # download the file if the fastq doesn't exist at all
+        if not os.path.isfile(cur_file) and not os.path.isfile(output[0]): 
+            shell("prefetch {wildcards.accession} && fasterq-dump -O {wildcards.dir} {wildcards.accession}")
+        
+        if not os.path.isfile(output[0]):
+            # Rename all files to be {accession}_1.fastq, even in the single-end case
+            assert(os.path.isfile(cur_file))
+            shell("mv {wildcards.dir}/{wildcards.accession}.fastq {output}")
+
+################################################################
+# GZip the FASTQ Files
+rule gzip_fastq:
+    input:
+        "{dir}/{accession}_1.fastq"
+    output:
+        "{dir}/{accession}_1.fastq.gz"
+    threads: config['threads']['gzip_fastq']
+    run:
+        shell("gzip {input}")
+
+################################################################
+# Tests the current cutadapt parameters on a small sample of the FASTQ files
+rule check_adapter:
+    input:
+        ribo_yaml   = get_ribo_yaml,
+        fastq_files = get_fastq_files
+    output:
+        "adapter_check_output/{study}/{accession}_cutadapt_stats.tsv"
+    threads: 
+        config['threads']['check_adapter']
+    run:
+        shell("mkdir -p adapter_check_output/{wildcards.study}")
+        
+        ribo_yaml = dict()
+        with open(input.ribo_yaml) as file:
+            ribo_yaml = yaml.load(file, Loader=yaml.FullLoader)
+        
+        ribo_srr_dict = get_riboseq_srr_dict(wildcards)
+
+        # the cutadapt parameters fails for all 
+        path = get_fastq_path(wildcards)
+
+        # generate a list for the final command
+        parameters = []            
+        parameters.append("set +o pipefail;")
+        parameters.append("zcat " + path  + " |")
+        parameters.append("head -n {skipped_reads} |".format(skipped_reads = 4 * config['check_adapter']['skipped_reads']))
+        parameters.append("tail -n {sample_size} - |".format(sample_size = 4 * config['check_adapter']['sample_size']))
+
+        # start assembling the cutadapt command 
+        ribo_cutadapt_parameters = ribo_yaml['clip_arguments']
+        rna_cutadapt_parameters  = ''
+
+        if 'rnaseq' in ribo_yaml:
+            rna_cutadapt_parameters = ribo_yaml['rnaseq']['clip_arguments']
+
+        # limit the amount of output coming from cutadapt, -j 0 adapts to number of cores available
+        cutadapt_base      = "cutadapt -j 0 -o /dev/null "
+        cur_SRR            = path.split("/")[-1].split(".")[0].split("_")[0]
+        cutadapt_parameter = ribo_cutadapt_parameters if cur_SRR in ribo_srr_dict else rna_cutadapt_parameters
+
+        tsv_output            = "adapter_check_output/" +  wildcards.study + "/" + wildcards.accession + "_cutadapt_stats.tsv"
+        full_cutadapt_command = cutadapt_base + cutadapt_parameter + " --report=minimal - > " + tsv_output + " 2> /dev/null"
+        parameters.append(full_cutadapt_command)
+        final_command         = " ".join(parameters)
+
+        # run the command
+        shell(final_command)
+
+################################################################
+# checks the output of the cutadapt settings 
+rule check_adapter_stats:
+    input:
+        ribo_yaml          = get_ribo_yaml,
+        cutadapt_summaries = get_cutadapt_summaries
+    output:
+        temp("{study}_adapter.yaml")
+    threads: config['threads']['check_adapter_stats']
+    run:
+        ribo_yaml = dict()
+
+        with open(input.ribo_yaml) as file:
+            ribo_yaml = yaml.load(file, Loader=yaml.FullLoader)
+
+        ribo_srr_dict = get_riboseq_srr_dict(wildcards)
+        ribo_exp_set  = set(ribo_srr_dict.keys())
+
+        rna_srr_dict = get_rnaseq_srr_dict(wildcards)
+        rna_exp_set  = set(rna_srr_dict.keys())
+
+        # initiate the modifications dict
+        output_dict = dict()
+        output_dict['has_low_adapter']   = False
+        output_dict['low_adapter_files'] = []
+
+        # keep track of the original adapter arguments
+        output_dict['initial_clip_arguments'] = ribo_yaml['clip_arguments']
+
+        # take care of the 'rnaseq' case
+        if 'rnaseq' in ribo_yaml:
+            output_dict['rnaseq']                           = dict()
+            output_dict['rnaseq']['initial_clip_arguments'] = ribo_yaml['rnaseq']['clip_arguments']
+            output_dict['rnaseq']['clip_arguments']         = ribo_yaml['rnaseq']['clip_arguments']
+            output_dict['rnaseq']['has_rnaseq_adapter']     = '-a' in ribo_yaml['rnaseq']['clip_arguments']
+            output_dict['rnaseq']['low_adapter_files']      = []
+
+        # read the output of the cutadapt report
+        incorrect_ribo_adapter_set = set()
+        incorrect_rna_adapter_set  = set()
+
+        for path in input.cutadapt_summaries:
+            cur_df                 = pd.read_csv(path, sep='\t')
+            cur_accession          = path.split('/')[-1].split('_')[0]
+            total_reads            = cur_df['in_reads'][0]
+            total_reads_w_adapters = cur_df['w/adapters'][0]
+            perc_reads_w_adapters  = (total_reads_w_adapters * 100)/total_reads
+            total_bp               = cur_df['in_bp'][0]
+            total_bp_qualtrim      = cur_df['qualtrim_bp'][0]
+            perc_bp_trimmed        = (total_bp_qualtrim * 100)/total_bp
+            print("Percentage of Reads with Adapters (%): {:.01f}".format(perc_reads_w_adapters))
+            print("Percentage of Base Pairs that were Quality Trimmed (%): {:.01f}".format(perc_bp_trimmed))
+
+            if perc_reads_w_adapters < config['adapter_threshold']:
+                if cur_accession in ribo_exp_set:
+                    incorrect_ribo_adapter_set.add(cur_accession)
+
+                elif cur_accession in rna_exp_set:
+                    incorrect_rna_adapter_set.add(cur_accession)
+
+        # fill in the modifications yaml
+        output_dict['low_adapter_files']  = list(incorrect_ribo_adapter_set)
+
+        # handle the Ribo-Seq case
+        if len(incorrect_ribo_adapter_set) > 0 and "-a" in ribo_yaml['clip_arguments']:
+            output_dict['has_low_adapter'] = True
+
+        # handle the RNA-Seq case
+        if 'rnaseq' in ribo_yaml and incorrect_rna_adapter_set == rna_exp_set:
+            # remove the adapter, there is none
+            output_dict['rnaseq']['low_adapter_files'] = list(incorrect_rna_adapter_set)
+            # remove the -a argument
+            try:
+                # accomodate adapter guesses, if there is one
+                cutadapt_arg_list = output_dict['rnaseq']['clip_arguments'].split(" ")
+                
+                # otherwise, remove the '-a' parameter, if applicable
+                adapter_flag_idx = cutadapt_arg_list.index('-a')
+                adapter_idx      = adapter_flag_idx + 1
+                del cutadapt_arg_list[adapter_flag_idx:adapter_idx + 1]
+
+                # also need to remove the --trimmed-only, if present
+                try:
+                    cutadapt_arg_list.remove("--trimmed-only")
+                except (ValueError):
+                    pass
+
+                # replace the clip_argument with the modified adapter
+                output_dict['rnaseq']['clip_arguments'] = " ".join(cutadapt_arg_list)
+            except (ValueError, IndexError):
+                pass
+            output_dict['rnaseq']['has_rnaseq_adapter'] = False
+
+        with open(output[0], mode = 'w') as f:
+            yaml.dump(output_dict, f)
+
+################################################################
+rule check_lengths:
+    input:
+        ribo_fastq_files = get_riboseq_srr_path,
+        rna_fastq_files  = get_rnaseq_srr_path,
+        ribo_yaml        = get_ribo_yaml
+    output:
+        temp("{study}_length.yaml")
+    threads: 1
+    run:
+        ribo_yaml = dict()
+        with open(input.ribo_yaml) as file:
+            ribo_yaml = yaml.load(file, Loader=yaml.FullLoader)
+        
+        ribo_srr_dict = get_riboseq_srr_dict(wildcards)
+        ribo_exp_set  = set(ribo_srr_dict.keys())
+
+        rna_srr_dict = get_rnaseq_srr_dict(wildcards)
+        rna_exp_set  = set(rna_srr_dict.keys())
+
+        # helper function that fills in the *_length.yaml output file 
+        # based on the read length information discovered in the fastq file
+        def fill_dictionary(fastq_files):
+            result_dict                           = dict()
+            result_dict['lengths']                = dict()
+            result_dict['uneven_files']           = []
+            result_dict['has_all_uneven_lengths'] = False
+            uneven_set                            = set()
+
+            min_length = -1
+            max_length = -1
+
+            for path in fastq_files:
+                cur_srr = path.split("/")[-1].split(".")[0].split("_")[0]
+                idx     = 0
+                len_set = set()
+                # read 1,000 sequences and record their lengths 
+                with gzip.open(path, "rt") as handle:
+                    for record in SeqIO.parse(handle, "fastq"):
+                        cur_len = len(record.seq)
+                        len_set.add(cur_len)
+                        
+                        if min_length == -1 or cur_len < min_length:
+                            min_length = cur_len
+                        if max_length == -1 or cur_len > max_length:
+                            max_length = cur_len
+                        
+                        idx += 1
+
+                        if idx > 1000:
+                            break
+                        
+                if len(len_set) > 1: # trimmed Ribo-Seq adapter
+                    uneven_set.add(cur_srr)
+
+                result_dict['lengths'][cur_srr]               = dict()
+                result_dict['lengths'][cur_srr]['min_length'] = min(len_set)
+                result_dict['lengths'][cur_srr]['max_length'] = max(len_set)
+
+            result_dict['uneven_files'] = list(uneven_set)
+            return result_dict
+
+        # if there are cases of uneven read lengths, then all of them need to be uneven and trimmed.
+        # otherwise, we need to split or configure the yaml files.
+        output_dict = fill_dictionary(input.ribo_fastq_files)
+
+        # initialize the clip argument fields
+        output_dict['initial_clip_arguments'] = ribo_yaml['clip_arguments']
+        output_dict['clip_arguments']         = ribo_yaml['clip_arguments']
+
+        # alter the values for the Ribo-Seq experiments only
+        if ribo_exp_set == set(output_dict['uneven_files']):
+            output_dict['has_all_uneven_lengths'] = True
+            output_dict['clip_arguments']         = "-u 1 --maximum-length=40 --minimum-length=15 --quality-cutoff=28"
+        
+        if 'rnaseq' in ribo_yaml:
+            output_dict['rnaseq']                           = fill_dictionary(input.rna_fastq_files)
+            output_dict['rnaseq']['initial_clip_arguments'] = ribo_yaml['rnaseq']['clip_arguments']
+            output_dict['rnaseq']['clip_arguments']         = ribo_yaml['rnaseq']['clip_arguments']
+        
+            if rna_exp_set == set(output_dict['rnaseq']['uneven_files']):
+                output_dict['rnaseq']['has_all_uneven_lengths'] = True
+
+                # remove the -a argument
+                try:
+                    # accomodate adapter guesses, if there is one
+                    cutadapt_arg_list = ribo_yaml['rnaseq']['clip_arguments'].split(" ")
+                    
+                    # otherwise, remove the '-a' parameter, if applicable
+                    adapter_flag_idx = cutadapt_arg_list.index('-a')
+                    adapter_idx      = adapter_flag_idx + 1
+                    del cutadapt_arg_list[adapter_flag_idx:adapter_idx + 1]
+                    
+                    try:
+                        # have removed the adapter at this point, also remove trimmed-only parameter
+                        cutadapt_arg_list.remove("--trimmed-only")
+                    except (ValueError):
+                        pass
+
+                    # replace the clip_argument with the modified adapter
+                    output_dict['rnaseq']['clip_arguments'] = " ".join(cutadapt_arg_list)
+                except (ValueError, IndexError):
+                    pass
+                    
+        with open(output[0], mode = 'w') as f:
+            yaml.dump(output_dict, f)
+
+################################################################
+rule modify_yaml:
+    input:
+        adapter_modification_yaml       = "{study}_adapter.yaml",
+        uneven_length_modification_yaml = "{study}_length.yaml",
+        guess_modification_yaml         = "{study}_guess.yaml",
+        ribo_yaml                       = get_ribo_yaml
+    output:
+        "input/modified_project/{study}/{study}_modified.yaml",
+        "modifications/{study}/modification.yaml"
+    run:
+        # load in values
+        ribo_yaml = dict()
+
+        with open(input.ribo_yaml) as file:
+            ribo_yaml = yaml.load(file, Loader=yaml.FullLoader)
+        
+        adapter_yaml = {}
+        length_yaml  = {}
+        guess_yaml   = {}
+
+        with open(input.adapter_modification_yaml) as file:
+            adapter_yaml = yaml.load(file, Loader=yaml.FullLoader)
+
+        with open(input.uneven_length_modification_yaml) as file:
+            length_yaml = yaml.load(file, Loader=yaml.FullLoader)
+
+        with open(input.guess_modification_yaml) as file:
+            guess_yaml = yaml.load(file, Loader=yaml.FullLoader)
+        
+        # length yaml either keeps original argument or removes adapter argument
+        ribo_yaml['clip_arguments'] = length_yaml['clip_arguments']
+        incorrect_ribo_adapter_list = adapter_yaml['low_adapter_files']
+        uneven_ribo_list            = length_yaml['uneven_files']
+
+        try:
+            # accomodate adapter guesses, if there is one
+            cutadapt_arg_list              = ribo_yaml['clip_arguments'].split(' ') 
+            # could raise value error, could not have an adapter
+            adapter_idx                    = cutadapt_arg_list.index('-a') + 1
+            cutadapt_arg_list[adapter_idx] = guess_yaml['consensus_adapter']
+            # could raise type error, trying to join a NoneType
+            guessed_adapter_arg            = " ".join(cutadapt_arg_list)
+            ribo_yaml['clip_arguments']    = guessed_adapter_arg
+
+        except (ValueError, TypeError):
+            pass
+
+        has_ribo_adapter = '-a' in ribo_yaml['clip_arguments']
+        has_trimmed_only = '--trimmed-only' in ribo_yaml['clip_arguments']
+
+        # always need to have --trimmed-only with -a and no -trimmed-only with no adapter
+        if has_ribo_adapter and not has_trimmed_only:
+            ribo_yaml['clip_arguments'] = ribo_yaml['clip_arguments'] + " --trimmed-only"
+        if not has_ribo_adapter and has_trimmed_only:
+            cutadapt_arg_list = ribo_yaml['clip_arguments'].split(" ")
+            cutadapt_arg_list.remove('--trimmed-only')
+            ribo_yaml['clip_arguments'] = " ".join(cutadapt_arg_list)
+        
+        # update values from modifications.yaml
+        ribo_yaml['input']['root_meta'] = "./" + output[0]
+        raise_exception                 = False
+
+        # only handle if this experiment has matching RNA-Seq
+        incorrect_rna_adapter_list = []
+        uneven_rna_list            = []
+
+        # resolve the options for adapters in the RNA-Seq experiments
+        if 'rnaseq' in ribo_yaml:
+            incorrect_rna_adapter_list            = adapter_yaml['rnaseq']['low_adapter_files']
+            uneven_rna_list                       = length_yaml['rnaseq']['uneven_files']
+            ribo_yaml['rnaseq']['clip_arguments'] = length_yaml['rnaseq']['clip_arguments']
+
+            try:
+                # accomodate adapter guesses, if there is one
+                cutadapt_arg_list                     = ribo_yaml['rnaseq']['clip_arguments'].split(' ') 
+                # could raise value error, could not have an adapter
+                adapter_idx                           = cutadapt_arg_list.index('-a') + 1
+                # could raise index error, consensus adapter can be None
+                cutadapt_arg_list[adapter_idx]        = guess_yaml['rnaseq']['consensus_adapter']
+                # could raise type error, trying to join a NoneType
+                guessed_adapter_arg                   = " ".join(cutadapt_arg_list)
+                ribo_yaml['rnaseq']['clip_arguments'] = guessed_adapter_arg
+            except(ValueError):
+                if guess_yaml['rnaseq']['consensus_adapter'] is not None:
+                    cutadapt_arg_list.append('-a')
+                    cutadapt_arg_list.append(guess_yaml['rnaseq']['consensus_adapter'])
+                    guessed_adapter_arg                   = " ".join(cutadapt_arg_list)
+                    ribo_yaml['rnaseq']['clip_arguments'] = guessed_adapter_arg
+            except(TypeError):
+                # no guessed adapter but there is an adapter argument
+                # this means that there is not an adapter
+                if not adapter_yaml['rnaseq']['has_rnaseq_adapter']:
+                    ribo_yaml['rnaseq']['clip_arguments'] = adapter_yaml['rnaseq']['clip_arguments']
+            
+            has_rnaseq_adapter = '-a' in ribo_yaml['rnaseq']['clip_arguments']
+            has_trimmed_only = '--trimmed-only' in ribo_yaml['rnaseq']['clip_arguments']
+            
+            # make sure that --trimmed-only does not exist without an adapter, we also don't want trimmed-only
+            if has_trimmed_only:
+                cutadapt_arg_list = ribo_yaml['rnaseq']['clip_arguments'].split(" ")
+                cutadapt_arg_list.remove('--trimmed-only')
+                ribo_yaml['rnaseq']['clip_arguments'] = " ".join(cutadapt_arg_list)
+        
+        original_yaml_path = os.path.join("/".join(input.ribo_yaml.split("/")[0:-1]), wildcards.study + "_modified.yaml")
+        with open(original_yaml_path, mode = 'w') as f:
+            yaml.dump(ribo_yaml, f)
+        
+        with open(output[0], mode = 'w') as f:
+            yaml.dump(ribo_yaml, f)
+        
+        merged_yaml = dict()
+        # write out a final merged modifications file based on the pre-run checks
+        with open(output[1], mode = 'w') as f:
+            merged_yaml = {'length_check' : copy.deepcopy(length_yaml), 'adapter_check' : copy.deepcopy(adapter_yaml), 'adapter_guess' : copy.deepcopy(guess_yaml)}
+            yaml.dump(merged_yaml, f)
+
+################################################################
+rule guess_adapter:
+    input:
+        ribo_yaml                 = get_ribo_yaml,
+        adapter_modification_yaml = "{study}_adapter.yaml"
+    output:
+        temp("{study}_guess.yaml")
+    run:
+        ribo_yaml = dict()
+        with open(input.ribo_yaml) as file:
+            ribo_yaml = yaml.load(file, Loader=yaml.FullLoader)
+        
+        adapter_yaml = {}
+        with open(input.adapter_modification_yaml) as file:
+            adapter_yaml = yaml.load(file, Loader=yaml.FullLoader)
+
+        output_yaml = {}
+
+        ribo_srr_dict = get_riboseq_srr_dict(wildcards)
+        ribo_exp_set  = set(ribo_srr_dict.keys())
+
+        rnaseq_dict    = {}
+        rna_fastq_base = ""
+
+        riboseq_dict = ribo_yaml['input']['fastq']
+
+        # A matching RNA-Seq may not exist for a given Ribo-Seq experiment
+        if 'rnaseq' in ribo_yaml:
+            rnaseq_dict    = ribo_yaml['rnaseq']['fastq']
+            rna_fastq_base = ribo_yaml['rnaseq']['fastq_base']
+
+            # RNA-Seq Experiments File Paths
+            for gsm in rnaseq_dict:
+                dir_list         = rnaseq_dict[gsm]
+                modify_dir_list  = [os.path.join(rna_fastq_base, dir) for dir in dir_list]
+                rnaseq_dict[gsm] = modify_dir_list
+
+
+        adapter_set                          = set()
+        output_yaml['has_multiple_adapters'] = False
+        output_yaml['consensus_adapter']     = None
+        output_yaml['detected_adapters']     = []
+
+        # guess the adapter on ribo-seq experiments with low adapter presence 
+        if adapter_yaml['has_low_adapter']:
+            for gsm in riboseq_dict:
+                output_yaml[gsm] = {}
+
+                for fastq_path in riboseq_dict[gsm]:
+                    dir_path_list = fastq_path.split("/")
+                    cur_srr       = dir_path_list[-1].split(".")[0].split("_")[0]
+                    try:
+                        skipped_reads       = config['guess_adapter']['skipped_reads']
+                        sample_size         = config['guess_adapter']['sample_size']
+                        min_length          = config['guess_adapter']['min_length']
+                        max_length          = config['guess_adapter']['max_length']
+                        skipped_nucleotides = config['guess_adapter']['skipped_nucleotides']
+                        seed_length         = config['guess_adapter']['seed_length']
+                        match_ratio         = config['guess_adapter']['match_ratio']
+                        adapter_guess       = guess_adapter(
+                                                fastq        = fastq_path, 
+                                                skippedreads = skipped_reads, 
+                                                verbose      = False, 
+                                                samplesize   = sample_size,
+                                                minlength    = min_length, 
+                                                maxlength    = max_length, 
+                                                kmerlength   = seed_length, 
+                                                matchratio   = match_ratio, 
+                                                skipnucs     = skipped_nucleotides, 
+                                                cutadapt     = False)
+                    except SystemExit:
+                        adapter_guess = None
+
+                    # splitting handles both cases: 
+                    # srr_1.fastq -> srr_1 -> srr; srr.fastq -> srr -> srr 
+                    output_yaml[gsm][cur_srr] = adapter_guess
+                    adapter_set.add(adapter_guess)
+        
+        output_yaml['detected_adapters'] = list(adapter_set)
+
+        if len(adapter_set) > 1:
+            output_yaml['has_multiple_adapters'] = True
+        elif len(adapter_set) == 1:
+            output_yaml['consensus_adapter'] = tuple(adapter_set)[0]
+        
+        # check the RNA-Seq Case
+        if 'rnaseq' in ribo_yaml:
+            rnaseq_adapter_set                             = set()
+            output_yaml['rnaseq']                          = dict()
+            output_yaml['rnaseq']['has_multiple_adapters'] = False
+            output_yaml['rnaseq']['consensus_adapter']     = None
+            output_yaml['rnaseq']['detected_adapters']     = []
+
+            if adapter_yaml['rnaseq']['low_adapter_files']:
+                for gsm in rnaseq_dict:
+                    output_yaml['rnaseq'][gsm] = {}
+
+                    for fastq_path in rnaseq_dict[gsm]:
+                        dir_path_list = fastq_path.split("/")
+                        cur_srr       = dir_path_list[-1].split(".")[0].split("_")[0]
+                        try:
+                            skipped_reads       = config['guess_adapter']['skipped_reads']
+                            sample_size         = config['guess_adapter']['sample_size']
+                            min_length          = config['guess_adapter']['min_length']
+                            max_length          = config['guess_adapter']['max_length']
+                            skipped_nucleotides = config['guess_adapter']['skipped_nucleotides']
+                            seed_length         = config['guess_adapter']['seed_length']
+                            match_ratio         = config['guess_adapter']['match_ratio']
+                            adapter_guess       = guess_adapter(
+                                                    fastq        = fastq_path, 
+                                                    skippedreads = skipped_reads, 
+                                                    verbose      = False, 
+                                                    samplesize   = sample_size,
+                                                    minlength    = min_length, 
+                                                    maxlength    = max_length, 
+                                                    kmerlength   = seed_length, 
+                                                    matchratio   = match_ratio, 
+                                                    skipnucs     = skipped_nucleotides, 
+                                                    cutadapt     = False)
+                        except SystemExit:
+                            adapter_guess = None
+                            
+                        # splitting handles both cases: 
+                        # srr_1.fastq -> srr_1 -> srr; srr.fastq -> srr -> srr 
+                        output_yaml['rnaseq'][gsm][cur_srr] = adapter_guess
+                        if adapter_guess is not None:
+                            rnaseq_adapter_set.add(adapter_guess)
+        
+            if len(rnaseq_adapter_set) > 1:
+                output_yaml['rnaseq']['has_multiple_adapters'] = True
+            elif len(rnaseq_adapter_set) == 1:
+                output_yaml['rnaseq']['consensus_adapter']     = tuple(rnaseq_adapter_set)[0]
+
+            output_yaml['rnaseq']['detected_adapters'] = list(rnaseq_adapter_set)
+
+        with open(output[0], mode = 'w') as f:
+            yaml.dump(output_yaml, f)
+
+################################################################
+rule classify_studies:
+    input:
+        adapter_modification_yaml_list       = ["{study}_adapter.yaml".format(study = study) for study in STUDIES],
+        uneven_length_modification_yaml_list = ["{study}_length.yaml".format(study = study) for study in STUDIES],
+        guess_modification_yaml              = ["{study}_guess.yaml".format(study = study) for study in STUDIES],
+        study_yaml_list                      = ["input/project/{gse_only}/{study}.yaml".format(gse_only = study.split("_")[0], study = study) for study in STUDIES],
+        modified_yaml_list                   = ["input/modified_project/{study}/{study}_modified.yaml".format(study = study) for study in STUDIES]
+    output:
+        "log/status.txt",
+        temp("log/valid_studies.txt"),
+        directory("log/failed/"),
+        directory("log/success/")
+    run:
+        valid_studies = set(STUDIES)
+        os.makedirs("log/failed/", exist_ok = True)
+        os.makedirs("log/success/", exist_ok = True)
+
+        # iterate over all of the studies 
+        for modified_yaml in input.modified_yaml_list:
+            # load in the yaml file
+            ribo_yaml = {}
+            with open(modified_yaml) as f:
+                ribo_yaml = yaml.load(f, Loader=yaml.FullLoader)
+            
+            study = modified_yaml.split("/")[-2]
+
+            # load in pre-run check outputs (check_adapter_stats, guess_adapter, check_lengths)
+            adapter_yaml = {}
+            length_yaml  = {}
+            guess_yaml   = {}
+
+            with open("{study}_adapter.yaml".format(study = study)) as file:
+                adapter_yaml = yaml.load(file, Loader=yaml.FullLoader)
+            with open("{study}_length.yaml".format(study = study)) as file:
+                length_yaml  = yaml.load(file, Loader=yaml.FullLoader)
+            with open("{study}_guess.yaml".format(study = study)) as file:
+                guess_yaml   = yaml.load(file, Loader=yaml.FullLoader)
+
+            # load in any files with low adapter presence or uneven length
+            incorrect_ribo_adapter_list = adapter_yaml['low_adapter_files']
+            uneven_ribo_list            = length_yaml['uneven_files']
+
+            incorrect_rna_adapter_list = []
+            uneven_rna_list            = []
+
+            if 'rnaseq' in ribo_yaml:
+                incorrect_rna_adapter_list = adapter_yaml['rnaseq']['low_adapter_files']
+                uneven_rna_list            = length_yaml['rnaseq']['uneven_files']
+
+            # set the default values, currently don;t use valid_adapters or valid_lengths
+            valid_lengths = True
+
+            # note that valid_adapters and valid_study aren't used, but help with legibility
+            # also may be of use down the line in case modifications are made
+            valid_adapters = True
+            valid_study    = True
+            message        = []
+
+            # Build the Message Output of the Log File
+            # Check for incorrect Ribo-Seq adapter
+            if len(incorrect_ribo_adapter_list) > 0:
+                message.append("The following Ribo-Seq files had fixed length reads and poor clipped adapter percentages.")
+                for SRR in incorrect_ribo_adapter_list:
+                    message.append(SRR)
+                
+                # a guessable adapter or a study with uneven lengths (assumed to be a pre-clipped adapter) are both resolvable
+                if not length_yaml['has_all_uneven_lengths'] and guess_yaml['consensus_adapter'] is None:
+                    message.append("Unable to guess an adapter, and not all experiments have uneven lengths to imply presence of a pre-clipped adapter. This study is invalid.")
+                    valid_studies.discard(study)
+                    valid_adapters = False
+                    valid_study    = False
+            else:
+                message.append("There are no experiments with a low adapter presence.")
+            
+
+            # Check for uneven lengths
+            if len(uneven_ribo_list) > 0:
+                message.append("The following Ribo-Seq files had uneven lengths.")
+                for SRR in uneven_ribo_list:
+                    message.append(SRR)
+                
+                if not length_yaml['has_all_uneven_lengths'] and guess_yaml['consensus_adapter'] is None:
+                    valid_studies.discard(study)
+                    valid_lengths = False
+                    valid_study   = False
+                    message.append("Not all files had uneven lengths, and there was no consensus guessed adapter. This study is invalid.")
+            else:
+                message.append("All Ribo-Seq files had a fixed length.")
+            
+            # check for any guessed adapters 
+            if guess_yaml['detected_adapters']:
+                message.append("The following adapters were guessed.")
+
+                for adapter in guess_yaml['detected_adapters']:
+                    message.append(str(adapter))
+
+                has_multiple_adapters = guess_yaml['detected_adapters'] is not None and len(guess_yaml['detected_adapters']) > 1
+
+                if has_multiple_adapters:
+                    valid_study = False
+                    valid_studies.discard(study)
+                    message.append("There are multiple adapters detected. This study is invalid.")
+
+            # repeat the checks on the RNA-Seq experiments, if applicable
+            if 'rnaseq' in ribo_yaml:
+                valid_rna_adapter = True
+                valid_rna_length  = True
+
+                has_rnaseq_adapter            = adapter_yaml['rnaseq']['has_rnaseq_adapter'] or guess_yaml['rnaseq']['consensus_adapter'] is not None
+                has_multiple_guessed_adapters = guess_yaml['rnaseq']['detected_adapters'] is not None and len(guess_yaml['rnaseq']['detected_adapters']) > 1
+
+                if has_multiple_guessed_adapters:
+                    valid_rna_adapter = False
+                    valid_study       = False
+                    valid_studies.discard(study)
+
+                    message.append("The following RNA-Seq adapters were guessed.")
+                    for adapter in guess_yaml['rnaseq']['detected_adapters']:
+                            f.write(str(adapter) + "\n")
+                
+                if len(incorrect_rna_adapter_list) > 0:
+                    message.append("The following RNA-Seq experiments initially had a low adapter presence.")
+                    for SRR in incorrect_rna_adapter_list:
+                        message.append(SRR)
+
+                if len(uneven_rna_list) > 0:
+                    message.append("The following RNA-Seq files had uneven lengths.")
+                    for SRR in uneven_rna_list:
+                        message.append(SRR)
+        
+            # bin the study by writing to either log/success or log/failed based on valid_study boolean
+            log_text = "\n".join(message) + "\n"
+            if valid_study:
+                os.makedirs("log/success/{study}/".format(study = study), exist_ok = True)
+                with open("log/success/{study}/modifications.log".format(study = study), "w") as f:
+                    f.write(log_text)
+            else:
+                os.makedirs("log/failed/{study}/".format(study = study), exist_ok = True)
+                with open("log/failed/{study}/modifications.log".format(study = study), "w") as f:
+                    f.write(log_text)
+        
+        # write the summary to the output file, log/status.txt
+        with open(output[0], "w") as f:
+            f.write("The following studies passed the pre-run checks.\n")
+
+            for study in valid_studies:
+                f.write(study + "\n")
+
+            invalid_studies = set(STUDIES) - valid_studies
+            f.write("The following studies failed the pre-run checks.\n")
+
+            for study in invalid_studies:
+                f.write(study + "\n")
+        
+        # write all valid studies for run_riboflow to read
+        with open(output[1], "w") as f:
+            for study in valid_studies:
+                f.write(study + "\n")
+
+################################################################
+rule run_riboflow:
+    input:
+        log_status = "log/status.txt",
+        valid_text = "log/valid_studies.txt",
+        study_yaml = "input/modified_project/{study}/{study}_modified.yaml"
+    output:
+        # note that the all.ribo file is not included in the output since not all instances will run RiboFlow
+        "log/riboflow_status/{study}/riboflow_status.txt"
+    params:
+        profile = config['riboflow_config']
+    threads: config['threads']['run_riboflow']
+    run:
+        # store valid set of studies from classify_studies rule
+        valid_set = set()
+
+        with open(input.valid_text, "r") as f:
+            for line in f:
+                valid_set.add(line.strip())
+
+        # run riboflow only on valid studies or if override is set to True
+        if wildcards.study in valid_set or config['override']:
+            shell("nextflow riboflow/RiboFlow.groovy -params-file {input.study_yaml} -profile {params.profile}")
+
+        os.makedirs("log/riboflow_status/{study}".format(study = wildcards.study), exist_ok = True)
+
+        # write status
+        with open("log/riboflow_status/{study}/riboflow_status.txt".format(study = wildcards.study), "w") as f:
+            if wildcards.study in valid_set:
+                f.write("Study {study} succeeded.\n".format(study = wildcards.study))
+            else:
+                f.write("Study {study} failed.\n".format(study = wildcards.study))

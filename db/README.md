@@ -1,0 +1,1 @@
+The file `db.sqlite3` must be in this folder before running SnakeScale pipeline.

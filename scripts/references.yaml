@@ -1,0 +1,42 @@
+
+# Paths are relative!
+# The fields: filter, transcriptome, regions, transcript_lengths
+# indicate the paths relative to the reference folder.
+
+# official_name must match the name in the database!
+
+"homo sapiens":
+  download_url: "https://github.com/RiboBase/reference_homo-sapiens/archive/refs/tags/v1.0.tar.gz"
+  official_name: "homo sapiens"
+  folder_name: "human"
+  filter: "filter/human/human_rtRNA*"
+  transcriptome: "transcriptome/human/appris_human_v2_selected*"
+  regions: "transcriptome/human/appris_human_v2_actual_regions.bed"
+  transcript_lengths: "transcriptome/human/appris_human_v2_transcript_lengths.tsv"
+
+"mus musculus":
+  download_url: "https://github.com/RiboBase/reference_mus-musculus/archive/refs/tags/v1.0.tar.gz"
+  official_name: "mus musculus"
+  folder_name: "mouse"
+  filter: 'filter/mouse/mouse_rtRNA*'
+  regions: 'transcriptome/mouse/appris_mouse_v2_actual_regions.bed'
+  transcript_lengths: 'transcriptome/mouse/appris_mouse_v2_transcript_lengths.tsv'
+  transcriptome: 'transcriptome/mouse/appris_mouse_v2_selected*'
+
+"arabidopsis thaliana":
+  download_url: "https://github.com/RiboBase/reference_arabidopsis-thaliana/archive/refs/tags/v1.0.tar.gz"
+  official_name: "arabidopsis thaliana"
+  folder_name: "arabidopsis"
+  filter: 'filter/arabidopsis/trna_rrna_seqs.fa*'
+  regions: 'transcriptome/arabidopsis/mrna_regions_unique_genes.bed'
+  transcript_lengths: 'transcriptome/arabidopsis/mrna_lengths_unique_genes.tsv'
+  transcriptome: 'transcriptome/arabidopsis/mrna_seqs_unique_genes.fa*'
+
+"caenorhabditis elegans":
+  download_url: "https://github.com/RiboBase/reference_caenorhabditis-elegans/archive/refs/tags/v1.0.tar.gz"
+  official_name: "caenorhabditis elegans"
+  folder_name: "celegans"
+  filter: 'filter/celegans/celegans_rRNA_new*'
+  regions: 'transcriptome/celegans/appris_celegans_v1_actual_regions_new.bed'
+  transcript_lengths: 'transcriptome/celegans/appris_celegans_v1_transcript_lengths_new.tsv'
+  transcriptome: 'transcriptome/celegans/appris_celegans_v1_new*'
