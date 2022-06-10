@@ -95,7 +95,7 @@ def generate_yaml(study, template, output, db, download_path,
             raise RuntimeError("Invalid run type {} for the study {}".format(study_contents[1], study_contents[0]) )
 
     study_query = 'SELECT "unitmetadata_study"."id", "unitmetadata_study"."creation_date",'\
-                  '"unitmetadata_study"."notes", "unitmetadata_study"."unitmetadata_checked", "unitmetadata_study"."modifier",'\
+                  '"unitmetadata_study"."notes", "unitmetadata_study"."metadata_checked", "unitmetadata_study"."modifier",'\
                   '"unitmetadata_study"."geo_accession", "unitmetadata_study"."study_accession", "unitmetadata_study"."study_title",'\
                   '"unitmetadata_study"."study_type", "unitmetadata_study"."study_abstract", "unitmetadata_study"."study_description",'\
                   '"unitmetadata_study"."xref_link", "unitmetadata_study"."submission_accession", "unitmetadata_study"."sradb_updated",'\
@@ -111,7 +111,7 @@ def generate_yaml(study, template, output, db, download_path,
     ribo_yaml = {}
     yaml_name = study
 
-    exp_query = '''SELECT "unitmetadata_experiment"."id", "unitmetadata_experiment"."creation_date", "unitmetadata_experiment"."notes", "unitmetadata_experiment"."unitmetadata_checked",\
+    exp_query = '''SELECT "unitmetadata_experiment"."id", "unitmetadata_experiment"."creation_date", "unitmetadata_experiment"."notes", "unitmetadata_experiment"."metadata_checked",\
                 "unitmetadata_experiment"."modifier", "unitmetadata_experiment"."study_id", "unitmetadata_experiment"."matched_experiment_id", "unitmetadata_experiment"."experiment_alias",\
                 "unitmetadata_experiment"."experiment_accession", "unitmetadata_experiment"."type", "unitmetadata_experiment"."title", "unitmetadata_experiment"."study_name",\
                 "unitmetadata_experiment"."design_description", "unitmetadata_experiment"."sample_accession", "unitmetadata_experiment"."sample_attribute", "unitmetadata_experiment"."library_strategy",\
