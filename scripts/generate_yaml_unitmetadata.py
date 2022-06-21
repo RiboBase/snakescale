@@ -61,8 +61,8 @@ def generate_clip_sequence(clipping_param_base, experiment_dict, experiment_type
         if len(candidate_adapter) > 0:
             clip_sequence = clip_sequence + " -a " + candidate_adapter + " --overlap=" + str(overlap)
             
-            if experiment_type == 'Ribo-Seq':
-                clip_sequence = clip_sequence + " --trimmed-only"
+            #if experiment_type == 'Ribo-Seq':
+            #    clip_sequence = clip_sequence + " --trimmed-only"
 
     return clip_sequence
 
