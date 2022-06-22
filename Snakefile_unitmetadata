@@ -562,8 +562,8 @@ rule modify_yaml:
         has_trimmed_only = '--trimmed-only' in ribo_yaml['clip_arguments']
 
         # always need to have --trimmed-only with -a and no -trimmed-only with no adapter
-        if has_ribo_adapter and not has_trimmed_only:
-            ribo_yaml['clip_arguments'] = ribo_yaml['clip_arguments'] + " --trimmed-only"
+        # if has_ribo_adapter and not has_trimmed_only:
+        #    ribo_yaml['clip_arguments'] = ribo_yaml['clip_arguments'] + " --trimmed-only"
         if not has_ribo_adapter and has_trimmed_only:
             cutadapt_arg_list = ribo_yaml['clip_arguments'].split(" ")
             cutadapt_arg_list.remove('--trimmed-only')
