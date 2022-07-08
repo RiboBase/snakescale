@@ -375,6 +375,9 @@ def _guess_adapter(fastq_reads,
 
         total_count = sum( list(map(lambda x: x[1], sorted_nucs))  )
 
+        if len(sorted_nucs) == 0:
+            break
+        
         max_nuc   = sorted_nucs[-1][0]
         max_count = sorted_nucs[-1][1]
 
